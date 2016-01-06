@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir>
+
+set -e            # fail fast
+set -o pipefail   # do not ignore exit codes when piping output
+# set -x          # enable debugging
+
+# Configure directories
+build_dir=$1
+cache_dir=$2
+
+compile_buildpack_dir=$(cd $(dirname $0); cd ..; pwd)
+compile_buildpack_bin=$compile_buildpack_dir/bin
+$compile_buildpack_dir/compile-extensions/bin/check_stack_support
+
+# Load some convenience functions like status(), echo(), and indent()
+source $compile_buildpack_dir/bin/common.sh
+
+BUILDPACK_PATH=$compile_buildpack_dir source $compile_buildpack_dir/compile-extensions/lib/common
+
+$compile_buildpack_dir/compile-extensions/bin/download_dependency openresty.tgz /tmp
+compile_nginx_tgz="/tmp/openresty.tgz"
+cd $build_dir
+
+# Alternate root location (default is root of project) for html/js/css
+# root: dist/
+if [[ "$(grep root: Staticfile)X" != "X" ]]; then
+  root_dir=$(grep root: Staticfile | sed -e 's/^root: *//;s/\s*$//')
+  status "Root folder $root_dir"
+else
+  status "Using root folder"
+fi
+root_dir=${root_dir:-.}
+
+status "Copying project files into public/"
+mkdir -p $cache_dir/public
+rsync -a \
+      --exclude='/Staticfile' \
+      --exclude='/Staticfile.auth' \
+      --exclude='/manifest.yml' \
+      --exclude='/stackato.yml' \
+      $root_dir/ $build_dir/public
+
+status "Setting up nginx"
+tar xzf $compile_nginx_tgz
+cp -f $compile_buildpack_dir/conf/nginx.conf openresty/nginx/conf/nginx.conf
+cp -f $compile_buildpack_dir/conf/mime.types openresty/nginx/conf/mime.types
+cp -f $compile_buildpack_dir/conf/gzip.types openresty/nginx/conf/gzip.types
+
+mkdir -p openresty/nginx/cache/tmp
+
+[[ -f $build_dir/public/nginx.conf ]] && mv $build_dir/public/nginx.conf openresty/nginx/conf/nginx.conf
+[[ -f $build_dir/public/mime.types ]] && mv $build_dir/public/mime.types openresty/nginx/conf/mime.types
+
+if [[ -f Staticfile.auth ]]; then
+  status "Enabling basic authentication"
+  mv Staticfile.auth nginx/conf/.htpasswd
+  cat openresty/nginx/conf/.htpasswd | indent
+  echo
+  protip "Learn about basic authentication" "https://github.com/drnic/staticfile-buildpack#basic-authentication"
+fi
+
+# Enable directory index
+if [[ "$(grep directory: Staticfile)X" != "X" ]]; then
+  status "Enabling directory index for folders without index.html files"
+  touch openresty/nginx/conf/.enable_directory_index
+fi
+
+# If we have a newrelic binding
+if [[ $VCAP_SERVICES == *"newrelic"* ]]
+then
+  status "Enabling Newrelic monitoring"
+  $compile_buildpack_dir/compile-extensions/bin/download_dependency nginx-nr-agent.tar.gz /tmp
+  tar xzf /tmp/nginx-nr-agent.tar.gz
+  cp $compile_buildpack_dir/conf/nginx-nr-agent.ini .nginx-nr-agent/nginx-nr-agent.ini
+  [[ -f $build_dir/public/nginx-nr-agent.ini ]] && mv $build_dir/public/nginx-nr-agent.ini .nginx-nr-agent/nginx-nr-agent.ini
+fi
+
+
+cp $compile_buildpack_bin/boot.sh .
+cp $compile_buildpack_bin/get_env .
+cp $compile_buildpack_bin/get_credentials .
